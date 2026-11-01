@@ -26,26 +26,13 @@ def setup_argparse():
     Sets up the argument parser for the command-line interface.
     """
     parser = argparse.ArgumentParser(
-        description="Audits actual permission usage of a process or user over a specified period to identify unused permissions."
+        description="Audits files under a root directory against a supplied access log. A file is reported as unused only when the access log does not list it. No process or user is monitored."
     )
 
     parser.add_argument(
-        "-p", "--process_name",
-        help="Name of the process to monitor (e.g., 'python').  Requires system monitoring tools to be installed separately and is beyond the scope of this script to implement.",
-        metavar="PROCESS_NAME"
-    )
-
-    parser.add_argument(
-        "-u", "--user",
-        help="Username to audit. Requires system monitoring tools or logs to be provided, which is beyond the scope of this script to implement.",
-        metavar="USERNAME"
-    )
-
-    parser.add_argument(
-        "-d", "--duration",
-        type=int,
-        help="Duration of the audit in seconds.",
-        metavar="SECONDS"
+        "--access-log",
+        help="Path to an access log file listing used paths, one per line (absolute paths or paths relative to the root directory). Required: without usage data the audit is not performed and the run exits 1.",
+        metavar="ACCESS_LOG_FILE"
     )
 
     parser.add_argument(
@@ -88,28 +75,52 @@ def load_whitelist(whitelist_file):
     Loads a whitelist of file paths from a file.
     Supports globbing using pathspec.
 
-    Args:
-        whitelist_file (str): Path to the whitelist file.
-
-    Returns:
-        pathspec.PathSpec: A PathSpec object containing the whitelist patterns, or None if the file doesn't exist or is empty.  Returns an empty PathSpec if there are issues loading it.
+    Returns a PathSpec, or None when the named file is missing, empty, or
+    unreadable. A named whitelist that cannot be loaded is an error, never a
+    silent empty whitelist.
     """
     try:
         if not os.path.exists(whitelist_file):
-            logging.warning(f"Whitelist file not found: {whitelist_file}")
-            return pathspec.PathSpec([])
+            logging.error(f"Whitelist file not found: {whitelist_file}")
+            return None
 
         with open(whitelist_file, "r") as f:
             lines = [line.strip() for line in f if line.strip()]
             if not lines:
-                logging.warning("Whitelist file is empty.")
-                return pathspec.PathSpec([])
-            spec = pathspec.PathSpec.from_lines("gitwildmatch", lines)
-            return spec
+                logging.error("Whitelist file is empty.")
+                return None
+            return pathspec.PathSpec.from_lines("gitwildmatch", lines)
 
     except Exception as e:
         logging.error(f"Error loading whitelist file: {e}")
-        return pathspec.PathSpec([])
+        return None
+
+
+def load_access_log(access_log_file, root_dir):
+    """
+    Loads the set of used paths from an access log file, one path per line.
+    Paths may be absolute or relative to the root directory.
+
+    Returns a set of normalized path keys, or None when the file is missing
+    or unreadable.
+    """
+    try:
+        if not os.path.isfile(access_log_file):
+            logging.error(f"Access log file not found: {access_log_file}")
+            return None
+        keys = set()
+        with open(access_log_file, "r") as f:
+            for line in f:
+                entry = line.strip()
+                if not entry:
+                    continue
+                keys.add(os.path.normpath(entry))
+                if os.path.isabs(entry):
+                    keys.add(os.path.normpath(os.path.relpath(entry, root_dir)))
+        return keys
+    except OSError as e:
+        logging.error(f"Error loading access log file: {e}")
+        return None
 
 
 def is_whitelisted(path, whitelist):
@@ -132,68 +143,61 @@ def is_whitelisted(path, whitelist):
         return False  # Assume not whitelisted on error to be safe
 
 
-def audit_permissions(root_dir, whitelist):
+def audit_permissions(root_dir, whitelist, used_paths, skip_paths=()):
     """
-    Audits permissions recursively starting from the root directory, excluding whitelisted paths.
+    Audits files under the root directory against real usage data.
 
-    Args:
-        root_dir (str): The root directory to start the audit from.
-        whitelist (pathspec.PathSpec): A PathSpec object containing the whitelist patterns.
+    A file counts as used only when its path appears in the access log set
+    loaded from the operator supplied access log. Files not listed there and
+    not whitelisted are reported as unused. The walk is sorted, so the same
+    inputs always produce the same findings in the same order.
 
-    Returns:
-        list: A list of file paths that are not used (according to a hypothetical monitoring system that is not implemented here)
+    Returns a tuple of (unused file paths, total files audited).
     """
     unused_permissions = []
+    total = 0
+    skip_resolved = {os.path.realpath(p) for p in skip_paths}
 
-    for root, _, files in os.walk(root_dir):
-        for file in files:
+    for root, dirs, files in os.walk(root_dir):
+        dirs.sort()
+        for file in sorted(files):
             filepath = os.path.join(root, file)
-            try:
-                # Normalize the path for matching against the whitelist
-                normalized_filepath = os.path.relpath(filepath, root_dir) if root_dir != "." else filepath # Relativize for whitelist matching if not the current directory
-                if is_whitelisted(normalized_filepath, whitelist):
-                    logging.debug(f"Skipping whitelisted file: {filepath}")
-                    continue
+            if os.path.realpath(filepath) in skip_resolved:
+                continue
+            total += 1
+            normalized_filepath = os.path.relpath(filepath, root_dir)
+            if is_whitelisted(normalized_filepath, whitelist):
+                logging.debug(f"Skipping whitelisted file: {filepath}")
+                continue
 
-                # Simulate permission usage monitoring (replace with actual monitoring logic)
-                # In a real implementation, this would involve monitoring file access events.
-                # For this example, we'll just assume that some files are "unused" randomly.
-                if hash(filepath) % 5 != 0:  # Simulate that 4 out of 5 files are "used".
-                    logging.debug(f"File '{filepath}' is considered used (simulated).")
-                    continue
+            if os.path.normpath(filepath) in used_paths or os.path.normpath(normalized_filepath) in used_paths:
+                logging.debug(f"File '{filepath}' is listed in the access log.")
+                continue
 
-                logging.info(f"Found potential unused permission: {filepath}")
-                unused_permissions.append(filepath)
+            logging.info(f"Found potential unused permission: {filepath}")
+            unused_permissions.append(filepath)
 
-            except OSError as e:
-                logging.error(f"Error accessing file: {filepath} - {e}")
-            except Exception as e:
-                logging.error(f"Unexpected error processing file: {filepath} - {e}")
-
-    return unused_permissions
+    return sorted(unused_permissions), total
 
 
-def output_results(unused_permissions, output_file=None):
+def output_results(unused_permissions, output_file=None, total=0):
     """
-    Outputs the results to the console and optionally to a file.
+    Outputs the results to the console and, when an output file is named, to
+    that file. A completed audit always writes the output file when one is
+    named, even when the unused list is empty.
 
-    Args:
-        unused_permissions (list): A list of file paths with potentially unused permissions.
-        output_file (str, optional): Path to the output file. Defaults to None.
+    Returns True on success, False when the output file could not be written.
     """
     console = Console()
 
     if not unused_permissions:
-        console.print("[green]No unused permissions found.[/green]")
-        return
-
-    table = Table(title="Potentially Unused Permissions", show_header=True, header_style="bold magenta")
-    table.add_column("File Path", style="cyan")
-
-    for path in unused_permissions:
-        table.add_row(path)
-
-    console.print(table)
+        console.print(f"[green]No unused permissions found in {total} files audited.[/green]")
+    else:
+        table = Table(title="Potentially Unused Permissions", show_header=True, header_style="bold magenta")
+        table.add_column("File Path", style="cyan")
+        for path in unused_permissions:
+            table.add_row(path)
+        console.print(table)
 
     if output_file:
         try:
@@ -203,6 +207,8 @@ def output_results(unused_permissions, output_file=None):
             console.print(f"[green]Results written to {output_file}[/green]")
         except Exception as e:
             console.print(f"[red]Error writing to output file: {e}[/red]")
+            return False
+    return True
 
 
 def main():
@@ -211,36 +217,62 @@ def main():
     """
     args = setup_argparse()
 
-    # Configure logging level based on debug flag
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
     else:
         logging.getLogger().setLevel(logging.INFO)
 
-    # Validate arguments (example: duration must be positive)
-    if args.duration is not None and args.duration <= 0:
-        logging.error("Duration must be a positive integer.")
+    # Wire the log file argument to an actual file handler.
+    try:
+        handler = logging.FileHandler(args.log_file)
+        handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logging.getLogger().addHandler(handler)
+    except OSError as e:
+        logging.error(f"Could not open log file {args.log_file}: {e}")
         sys.exit(1)
 
-    # Load whitelist
-    whitelist = load_whitelist(args.whitelist) if args.whitelist else None
+    if not os.path.isdir(args.root_dir):
+        logging.error(f"Not checked: root directory does not exist: {args.root_dir}")
+        sys.exit(1)
 
-    if args.process_name or args.user or args.duration:
-        logging.warning("Process/User monitoring is a placeholder.  This script does not automatically monitor process or user activity.  Requires external tools and logging.")
+    if not args.access_log:
+        logging.error("Not checked: no usage data supplied. Provide --access-log with a file listing used paths.")
+        sys.exit(1)
 
-    # Start the audit
+    used_paths = load_access_log(args.access_log, args.root_dir)
+    if used_paths is None:
+        sys.exit(1)
+
+    whitelist = None
+    if args.whitelist:
+        whitelist = load_whitelist(args.whitelist)
+        if whitelist is None:
+            sys.exit(1)
+
+    if args.output:
+        root_resolved = os.path.realpath(args.root_dir)
+        output_resolved = os.path.realpath(args.output)
+        input_paths = [args.access_log, args.log_file] + ([args.whitelist] if args.whitelist else [])
+        if output_resolved == root_resolved or output_resolved.startswith(root_resolved + os.sep) or output_resolved in {os.path.realpath(p) for p in input_paths}:
+            logging.error("Output file must not be inside the audited root directory or equal an input file.")
+            sys.exit(1)
+
     logging.info(f"Starting permission audit from root directory: {args.root_dir}")
     if whitelist:
         logging.info(f"Using whitelist file: {args.whitelist}")
     start_time = time.time()
 
-    unused_permissions = audit_permissions(args.root_dir, whitelist)
+    unused_permissions, total = audit_permissions(args.root_dir, whitelist, used_paths, skip_paths=[args.log_file])
 
     end_time = time.time()
     logging.info(f"Permission audit completed in {end_time - start_time:.2f} seconds.")
 
-    # Output the results
-    output_results(unused_permissions, args.output)
+    if total == 0:
+        logging.error("Not checked: no files found under the root directory, so nothing was audited.")
+        sys.exit(1)
+
+    if not output_results(unused_permissions, args.output, total):
+        sys.exit(1)
 
 
 if __name__ == "__main__":
