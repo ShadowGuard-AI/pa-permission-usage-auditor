@@ -116,6 +116,11 @@ def load_access_log(access_log_file, root_dir):
                     continue
                 keys.add(os.path.normpath(entry))
                 if os.path.isabs(entry):
+                    # Absolute log entries are stored twice, as written and relative to
+                    # the root, but relative entries are stored only as written. The
+                    # audit side checks both shapes, which mostly covers the asymmetry;
+                    # an entry written with a leading ./ survives only because normpath
+                    # strips it on both sides.
                     keys.add(os.path.normpath(os.path.relpath(entry, root_dir)))
         return keys
     except OSError as e:
@@ -137,6 +142,9 @@ def is_whitelisted(path, whitelist):
     if not whitelist:
         return False
     try:
+        # Matching happens on the path relative to the root. A whitelist
+        # pattern a user wrote with the root directory in front of it will
+        # never match anything here, and the failure is silent.
         return whitelist.match_file(path)
     except Exception as e:
         logging.error(f"Error matching path against whitelist: {e}")
@@ -164,6 +172,10 @@ def audit_permissions(root_dir, whitelist, used_paths, skip_paths=()):
             filepath = os.path.join(root, file)
             if os.path.realpath(filepath) in skip_resolved:
                 continue
+            # The counter rises before the whitelist test, so the audited total
+            # in the summary includes whitelisted files that were never compared
+            # against the access log. The number is files walked past the skip
+            # list, not files actually judged.
             total += 1
             normalized_filepath = os.path.relpath(filepath, root_dir)
             if is_whitelisted(normalized_filepath, whitelist):
@@ -262,6 +274,10 @@ def main():
         logging.info(f"Using whitelist file: {args.whitelist}")
     start_time = time.time()
 
+    # Only the log file is passed as a skip path. If the access log or
+    # the whitelist file sits inside the audited root, those input files
+    # are walked and can be reported as unused by the very run that is
+    # reading them.
     unused_permissions, total = audit_permissions(args.root_dir, whitelist, used_paths, skip_paths=[args.log_file])
 
     end_time = time.time()
